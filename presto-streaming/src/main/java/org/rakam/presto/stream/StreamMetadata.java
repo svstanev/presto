@@ -1,0 +1,541 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.rakam.presto.stream;
+
+import com.facebook.presto.Session;
+import com.facebook.presto.metadata.SessionPropertyManager;
+import com.facebook.presto.operator.GroupByHash;
+import com.facebook.presto.operator.aggregation.Accumulator;
+import com.facebook.presto.operator.aggregation.GroupedAccumulator;
+import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.ColumnMetadata;
+import com.facebook.presto.spi.ConnectorInsertTableHandle;
+import com.facebook.presto.spi.ConnectorMetadata;
+import com.facebook.presto.spi.ConnectorOutputTableHandle;
+import com.facebook.presto.spi.ConnectorSession;
+import com.facebook.presto.spi.ConnectorTableHandle;
+import com.facebook.presto.spi.ConnectorTableMetadata;
+import com.facebook.presto.spi.ConnectorViewDefinition;
+import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.SchemaTablePrefix;
+import com.facebook.presto.spi.StandardErrorCode;
+import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.spi.type.TypeSignature;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableListMultimap;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Multimaps;
+
+import io.airlift.log.Logger;
+import io.airlift.slice.Slice;
+import io.airlift.units.Duration;
+
+import org.rakam.presto.stream.analyze.AggregationQuery;
+import org.rakam.presto.stream.analyze.QueryAnalyzer;
+import org.rakam.presto.stream.metadata.ForMetadata;
+import org.rakam.presto.stream.metadata.MetadataDao;
+import org.rakam.presto.stream.metadata.Table;
+import org.rakam.presto.stream.metadata.TableColumn;
+import org.rakam.presto.stream.storage.GroupByRowTable;
+import org.rakam.presto.stream.storage.MaterializedView;
+import org.rakam.presto.stream.storage.SimpleRowTable;
+import org.rakam.presto.stream.storage.StreamInsertTableHandle;
+import org.rakam.presto.stream.storage.StreamStorageManager;
+
+import org.skife.jdbi.v2.IDBI;
+import org.skife.jdbi.v2.exceptions.UnableToExecuteStatementException;
+import org.skife.jdbi.v2.exceptions.UnableToObtainConnectionException;
+
+import javax.inject.Inject;
+
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import static com.facebook.presto.spi.StandardErrorCode.ALREADY_EXISTS;
+import static com.facebook.presto.spi.StandardErrorCode.NOT_FOUND;
+import static com.facebook.presto.spi.block.SortOrder.ASC_NULLS_FIRST;
+import static com.facebook.presto.spi.type.TimeZoneKey.UTC_KEY;
+import static com.google.common.base.Preconditions.checkArgument;
+import static java.lang.String.format;
+import static java.lang.Thread.sleep;
+import static java.util.Collections.emptyList;
+import static java.util.Collections.emptyMap;
+import static java.util.Collections.nCopies;
+import static java.util.Locale.ENGLISH;
+import static java.util.Objects.requireNonNull;
+import static java.util.stream.Collectors.toList;
+
+import static org.rakam.presto.stream.util.Types.checkType;
+
+public class StreamMetadata
+        implements ConnectorMetadata
+{
+    private static final Logger log = Logger.get(StreamMetadata.class);
+
+    private final String connectorId;
+    private final IDBI dbi;
+
+    private final StreamStorageManager storageAdapter;
+    private final QueryAnalyzer queryAnalyzer;
+    private final MetadataDao dao;
+
+    @Inject
+    public StreamMetadata(
+            StreamConnectorId connectorId,
+            @ForMetadata IDBI dbi,
+            StreamStorageManager storageAdapter,
+            QueryAnalyzer queryAnalyzer) throws InterruptedException
+    {
+        this.connectorId = requireNonNull(connectorId, "connectorId is null").toString();
+        this.queryAnalyzer = requireNonNull(queryAnalyzer, "localQueryRunner is null");
+        this.dbi = dbi;
+        this.dao = dbi.onDemand(MetadataDao.class);
+        this.storageAdapter = storageAdapter;
+
+        Duration delay = new Duration(10, TimeUnit.SECONDS);
+        while (true) {
+            try {
+                this.dao.createTableTables();
+                this.dao.createTableColumns();
+                return;
+            }
+            catch (UnableToObtainConnectionException e) {
+                log.warn("Failed to connect to database. Will retry again in %s. Exception: %s", delay, e.getMessage());
+                sleep(delay.toMillis());
+            }
+        }
+//        db = DBMaker.newFileDB(new File("./test")).make().createHashMap("metadata").make();
+    }
+
+    @Override
+    public List<String> listSchemaNames(ConnectorSession session)
+    {
+        return this.dao.listSchemaNames(this.connectorId);
+    }
+
+    @Override
+    public ConnectorTableHandle getTableHandle(ConnectorSession session, SchemaTableName tableName)
+    {
+        return this.getTableHandle(tableName);
+    }
+
+    private ConnectorTableHandle getTableHandle(SchemaTableName tableName)
+    {
+        requireNonNull(tableName, "tableName is null");
+        Table table = this.dao.getTableInformation(this.connectorId, tableName.getSchemaName(), tableName.getTableName());
+        if (table == null) {
+            return null;
+        }
+        List<TableColumn> tableColumns = this.dao.getTableColumns(table.getTableId());
+        checkArgument(!tableColumns.isEmpty(), "Table %s does not have any columns", tableName);
+
+        StreamColumnHandle countColumnHandle = null;
+        for (TableColumn tableColumn : tableColumns) {
+            if (countColumnHandle == null && tableColumn.getDataType().getJavaType().isPrimitive()) {
+                countColumnHandle = this.getColumnHandle(tableColumn);
+            }
+        }
+
+        return new StreamTableHandle(
+                this.connectorId,
+                tableName.getSchemaName(),
+                tableName.getTableName(),
+                table.getTableId());
+    }
+
+    @Override
+    public ConnectorTableMetadata getTableMetadata(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        StreamTableHandle handle = checkType(tableHandle, StreamTableHandle.class, "tableHandle");
+        SchemaTableName tableName = new SchemaTableName(handle.getSchemaName(), handle.getTableName());
+        List<ColumnMetadata> columns = this.dao.getTableColumns(handle.getTableId()).stream()
+                .map(TableColumn::toColumnMetadata)
+                .collect(toList());
+        if (columns.isEmpty()) {
+            throw new PrestoException(StreamErrorCode.STREAM_ERROR, "Table does not have any columns: " + tableName);
+        }
+        return new ConnectorTableMetadata(tableName, columns);
+    }
+
+    public Table getTable(String schemaName, String tableName)
+    {
+        return this.dao.getTableInformation(this.connectorId, schemaName, tableName);
+    }
+
+    @Override
+    public List<SchemaTableName> listTables(ConnectorSession session, String schemaNameOrNull)
+    {
+        return this.dao.listTables(this.connectorId, schemaNameOrNull);
+    }
+
+    @Override
+    public ColumnHandle getSampleWeightColumnHandle(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        return null;
+    }
+
+    @Override
+    public boolean canCreateSampledTables(ConnectorSession session)
+    {
+        return false;
+    }
+
+    private StreamColumnHandle getColumnHandle(TableColumn tableColumn)
+    {
+        return new StreamColumnHandle(this.connectorId, tableColumn.getColumnName(), tableColumn.getOrdinalPosition(), tableColumn.getDataType(), tableColumn.getIsAggregationField());
+    }
+
+    @Override
+    public Map<String, ColumnHandle> getColumnHandles(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        StreamTableHandle raptorTableHandle = checkType(tableHandle, StreamTableHandle.class, "tableHandle");
+        ImmutableMap.Builder<String, ColumnHandle> builder = ImmutableMap.builder();
+        for (TableColumn tableColumn : this.dao.listTableColumns(raptorTableHandle.getTableId())) {
+            builder.put(tableColumn.getColumnName(), this.getColumnHandle(tableColumn));
+        }
+        return builder.build();
+    }
+
+    @Override
+    public Map<SchemaTableName, List<ColumnMetadata>> listTableColumns(ConnectorSession session, SchemaTablePrefix prefix)
+    {
+        requireNonNull(prefix, "prefix is null");
+
+        ImmutableListMultimap.Builder<SchemaTableName, ColumnMetadata> columns = ImmutableListMultimap.builder();
+        for (TableColumn tableColumn : this.dao.listTableColumns(this.connectorId, prefix.getSchemaName(), prefix.getTableName())) {
+            ColumnMetadata columnMetadata = new ColumnMetadata(tableColumn.getColumnName(), tableColumn.getDataType(), false);
+            columns.put(tableColumn.getTable(), columnMetadata);
+        }
+        return Multimaps.asMap(columns.build());
+    }
+
+    @Override
+    public void createTable(ConnectorSession session, ConnectorTableMetadata tableMetadata)
+    {
+        throw new PrestoException(StandardErrorCode.NOT_SUPPORTED, "Create table is not supported. Use create view for stream data.");
+    }
+
+    @Override
+    public void dropTable(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        throw new PrestoException(StandardErrorCode.NOT_SUPPORTED, "Create table is not supported. Use create view for stream data.");
+    }
+
+    @Override
+    public void renameTable(ConnectorSession session, ConnectorTableHandle tableHandle, SchemaTableName newTableName)
+    {
+        throw new PrestoException(StandardErrorCode.NOT_SUPPORTED, "Create table is not supported. Use create view for stream data.");
+    }
+
+    @Override
+    public ConnectorOutputTableHandle beginCreateTable(ConnectorSession session, ConnectorTableMetadata tableMetadata)
+    {
+        throw new PrestoException(StandardErrorCode.NOT_SUPPORTED, "Create table is not supported. Use create view for stream data.");
+    }
+
+    @Override
+    public void commitCreateTable(ConnectorSession session, ConnectorOutputTableHandle tableHandle, Collection<Slice> fragments)
+    {
+        throw new PrestoException(StandardErrorCode.NOT_SUPPORTED, "Create table is not supported. Use create view for stream data.");
+    }
+
+    private List<StreamColumnHandle> getSortColumnHandles(long tableId)
+    {
+        ImmutableList.Builder<StreamColumnHandle> builder = ImmutableList.builder();
+        for (TableColumn tableColumn : this.dao.listSortColumns(tableId)) {
+            builder.add(this.getColumnHandle(tableColumn));
+        }
+        return builder.build();
+    }
+
+    @Override
+    public ConnectorInsertTableHandle beginInsert(ConnectorSession session, ConnectorTableHandle tableHandle)
+    {
+        StreamTableHandle tableHandle1 = checkType(tableHandle, StreamTableHandle.class, "tableHandle");
+        long tableId = tableHandle1.getTableId();
+
+        ImmutableList.Builder<StreamColumnHandle> columnHandles = ImmutableList.builder();
+        ImmutableList.Builder<Type> columnTypes = ImmutableList.builder();
+        for (TableColumn column : this.dao.getTableColumns(tableId)) {
+            columnHandles.add(new StreamColumnHandle(this.connectorId, column.getColumnName(), column.getOrdinalPosition(), column.getDataType(), column.getIsAggregationField()));
+            columnTypes.add(column.getDataType());
+        }
+
+        Optional<String> externalBatchId = Optional.ofNullable(null); //Optional.ofNullable(session.getProperty("external_batch_id", String.class)); //session.getProperty("external_batch_id", String.class);
+        List<StreamColumnHandle> sortColumnHandles = this.getSortColumnHandles(tableId);
+        return new StreamInsertTableHandle(this.connectorId,
+                tableId,
+                columnHandles.build(),
+                columnTypes.build(),
+                externalBatchId,
+                sortColumnHandles,
+                nCopies(sortColumnHandles.size(), ASC_NULLS_FIRST));
+    }
+
+    @Override
+    public void commitInsert(ConnectorSession session, ConnectorInsertTableHandle insertHandle, Collection<Slice> fragments)
+    {
+    }
+
+    @Override
+    public void createView(ConnectorSession userSession, SchemaTableName viewName, String viewData, boolean replace)
+    {
+        /*
+        JsonNode tree;
+
+        try {
+            tree = new ObjectMapper().readTree(viewData);
+        }
+        catch (Exception e) {
+            return;
+        }
+        String originalSql = tree.get("originalSql").asText();
+        */
+
+        ViewDefinition viewDefinition;
+        try {
+            viewDefinition = new ObjectMapper().readValue(viewData, ViewDefinition.class);
+        }
+        catch (Exception e) {
+            return;
+        }
+        String originalSql = viewDefinition.getOriginalSql();
+        SessionPropertyManager sessionPropertyManager = new SessionPropertyManager();
+        Session session = Session.builder(sessionPropertyManager)
+                .setIdentity(userSession.getIdentity())
+                .setSource("test")
+                .setCatalog("stream")
+                .setSchema("default")
+                .setTimeZoneKey(UTC_KEY)
+                .setLocale(ENGLISH)
+                .build();
+
+        AggregationQuery execute = this.queryAnalyzer.execute(session, originalSql);
+
+        if (replace) {
+            throw new PrestoException(StandardErrorCode.NOT_SUPPORTED, "View replace is not supported.");
+        }
+
+        Long newTableId = this.dbi.inTransaction((handle, status) -> {
+            MetadataDao dao = handle.attach(MetadataDao.class);
+            long tableId = 0;
+            try {
+                tableId = dao.insertTable(this.connectorId, viewName.getSchemaName(), viewName.getTableName(), execute.isGroupByQuery());
+            }
+            catch (UnableToExecuteStatementException e) {
+                if (e.getCause() instanceof SQLException) {
+                    String state = ((SQLException) e.getCause()).getSQLState();
+                    if (state.startsWith("23")) {
+                        return null;
+                    }
+                }
+                throw e;
+            }
+
+            for (QueryAnalyzer.AggregationField field : execute.aggregationFields) {
+                TypeSignature typeSignature = field.colType.getTypeSignature();
+                byte[] bytes = new ObjectMapper().writeValueAsBytes(field.functionSignature);
+                dao.insertColumn(tableId, field.colName, bytes, field.position, true, typeSignature.toString());
+            }
+
+            for (QueryAnalyzer.GroupByField field : execute.groupByFields) {
+                TypeSignature typeSignature = field.colType.getTypeSignature();
+                dao.insertColumn(tableId, field.colName, null, field.position, false, typeSignature.toString());
+            }
+            return tableId;
+        });
+
+        if (newTableId == null) {
+            throw new PrestoException(ALREADY_EXISTS, "View already exists: " + viewName);
+        }
+
+        MaterializedView view;
+        if (!execute.isGroupByQuery()) {
+            view = new SimpleRowTable(execute.aggregationFields.stream()
+                    .map(x -> x.accumulatorFactory.createAccumulator())
+                    .toArray(Accumulator[]::new));
+        }
+        else {
+            GroupedAccumulator[] groupedAggregations = execute.aggregationFields.stream()
+                    .map(x -> x.accumulatorFactory.createGroupedAccumulator())
+                    .toArray(GroupedAccumulator[]::new);
+
+            List<Type> types = execute.groupByFields.stream().map(x -> x.colType).collect(Collectors.toList());
+            int[] positions = execute.groupByFields.stream().mapToInt(x -> x.position).toArray();
+
+            Optional<Integer> maskChannel = Optional.empty();
+            Optional<Integer> inputHashChannel = Optional.empty();
+            int expectedSize = 10000;
+
+            GroupByHash groupByHash = GroupByHash.createGroupByHash(types, positions, maskChannel, inputHashChannel, expectedSize);
+            view = new GroupByRowTable(groupedAggregations, groupByHash, positions);
+        }
+
+        this.storageAdapter.addMaterializedView(newTableId, view);
+    }
+
+    @Override
+    public void dropView(ConnectorSession session, SchemaTableName viewName)
+    {
+//        dao.dropTable(viewName.getSchemaName());
+    }
+
+    @Override
+    public List<SchemaTableName> listViews(ConnectorSession session, String schemaNameOrNull)
+    {
+        return emptyList();
+    }
+
+    @Override
+    public Map<SchemaTableName, ConnectorViewDefinition> getViews(ConnectorSession session, SchemaTablePrefix prefix)
+    {
+        return emptyMap();
+    }
+
+    @Override
+    public ColumnMetadata getColumnMetadata(ConnectorSession session, ConnectorTableHandle tableHandle, ColumnHandle columnHandle)
+    {
+        long tableId = checkType(tableHandle, StreamTableHandle.class, "tableHandle").getTableId();
+        String columnName = checkType(columnHandle, StreamColumnHandle.class, "columnHandle").getColumnName();
+
+        TableColumn tableColumn = this.dao.getTableColumn(tableId, columnName);
+        if (tableColumn == null) {
+            throw new PrestoException(NOT_FOUND, format("Column %s does not exist for table ID %s", columnName, tableId));
+        }
+        return tableColumn.toColumnMetadata();
+    }
+
+    public QueryAnalyzer getQueryAnalyzer()
+    {
+        return null;
+    }
+}
+
+class ViewDefinition
+{
+    static class ColumnDefinition
+    {
+        private String name;
+        private String type;
+
+        public ColumnDefinition()
+        {
+        }
+
+        public ColumnDefinition(String name, String type)
+        {
+            this.name = name;
+            this.type = type;
+        }
+
+        public String getName()
+        {
+            return this.name;
+        }
+
+        public void setName(String name)
+        {
+            this.name = name;
+        }
+
+        public String getType()
+        {
+            return this.type;
+        }
+
+        public void setType(String type)
+        {
+            this.type = type;
+        }
+    }
+
+    private String originalSql;
+    private String catalog;
+    private String schema;
+    private ArrayList<ColumnDefinition> columns;
+    private String owner;
+
+    public ViewDefinition()
+    {
+    }
+
+    public ViewDefinition(String originalSql, String catalog, String schema, ArrayList<ColumnDefinition> columns, String owner)
+    {
+        this.originalSql = originalSql;
+        this.catalog = catalog;
+        this.schema = schema;
+        this.columns = columns;
+        this.owner = owner;
+    }
+
+    public String getOriginalSql()
+    {
+        return this.originalSql;
+    }
+
+    public void setOriginalSql(String originalSql)
+    {
+        this.originalSql = originalSql;
+    }
+
+    public String getCatalog()
+    {
+        return this.catalog;
+    }
+
+    public void setCatalog(String catalog)
+    {
+        this.catalog = catalog;
+    }
+
+    public String getSchema()
+    {
+        return this.schema;
+    }
+
+    public void setSchema(String schema)
+    {
+        this.schema = schema;
+    }
+
+    public ArrayList<ColumnDefinition> getColumns()
+    {
+        return this.columns;
+    }
+
+    public void setColumns(ArrayList<ColumnDefinition> columns)
+    {
+        this.columns = columns;
+    }
+
+    public String getOwner()
+    {
+        return this.owner;
+    }
+
+    public void setOwner(String owner)
+    {
+        this.owner = owner;
+    }
+}

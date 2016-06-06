@@ -1,0 +1,14 @@
+connector.name=stream
+metadata.db.type=mysql
+metadata.db.host=192.168.59.103
+metadata.db.port=3306
+metadata.db.database=presto-streaming
+metadata.db.username=admin
+metadata.db.password=svstanev
+
+#connector.name=raptor
+#metadata.db.type=h2
+#metadata.db.filename=./var/presto/streaming/db/MetaStore
+#metadata.db.type=mysql
+#metadata.db.connections.max=500
+#storage.data-directory=var/presto/streaming
